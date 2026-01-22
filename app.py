@@ -3,43 +3,104 @@ import requests
 from bs4 import BeautifulSoup
 import re
 from PyPDF2 import PdfReader
-from huggingface_hub import InferenceClient
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 # ==============================
 # PAGE CONFIG
 # ==============================
 st.set_page_config(
     page_title="TermsInShort",
-    page_icon="📄",
-    layout="centered"
-)
-
-st.title("📄 TermsInShort")
-st.caption("Terms & Privacy. In plain English.")
-
-# ==============================
-# LOAD HF TOKEN SAFELY
-# ==============================
-HF_TOKEN = ""
-try:
-    HF_TOKEN = st.secrets["HF_TOKEN"]
-except Exception:
-    HF_TOKEN = ""
-
-# ==============================
-# LLM CLIENT (FAST & RELIABLE)
-# ==============================
-client = InferenceClient(
-    model="HuggingFaceH4/zephyr-7b-beta",
-    token=HF_TOKEN
+    layout="wide"
 )
 
 # ==============================
-# NLP HELPERS
+# REMOVE STREAMLIT DEFAULT UI
+# ==============================
+st.markdown("""
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+# ==============================
+# GLOBAL THEME
+# ==============================
+st.markdown("""
+<style>
+/* Background */
+.stApp {
+    background-color: #2f7cf4;
+}
+
+/* Main container width */
+.block-container {
+    padding-top: 1.5rem;
+    max-width: 1100px;
+}
+
+/* Brand */
+.brand {
+    font-size: 48px;
+    font-weight: 700;
+    color: white;
+    margin-left: -240px;
+    margin-top: -45px;
+}
+
+/* Subtitle */
+.subtitle {
+    color: #E0E7FF;
+    margin-top: -6px;
+    margin-left: -240px;
+    margin-bottom: 20px;
+}
+
+/* Buttons */
+.stButton > button {
+    background-color: #1E40AF;
+    color: white;
+    border-radius: 10px;
+    padding: 0.6rem 1.6rem;
+    font-weight: 600;
+    border: none;
+}
+
+.stButton > button:hover {
+    background-color: #1E3A8A;
+}
+
+/* Result card */
+.result-card {
+    background-color: #1E3A8A;
+    color: white;
+    padding: 2rem;
+    border-radius: 16px;
+    margin-top: 2rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ==============================
+# TOP LEFT BRAND
+# ==============================
+st.markdown("""
+<div class="brand">TermsInShort</div>
+<div class="subtitle">Terms of Service (ToS) Scanner</div>
+""", unsafe_allow_html=True)
+
+st.markdown("<br><br>", unsafe_allow_html=True)
+
+# ==============================
+# TEXT EXTRACTION
 # ==============================
 def fetch_text_from_url(url):
-    r = requests.get(url, timeout=10)
-    soup = BeautifulSoup(r.text, "html.parser")
+    response = requests.get(url, timeout=10)
+    soup = BeautifulSoup(response.text, "html.parser")
 
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
@@ -55,113 +116,92 @@ def extract_text_from_pdf(file):
         text += page.extract_text() or ""
     return re.sub(r"\s+", " ", text)
 
+# ==============================
+# NLP PIPELINE
+# ==============================
+def split_sentences(text):
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if len(s.strip()) > 30]
 
-def chunk_text(text, max_chars=2500):
-    chunks = []
-    while len(text) > max_chars:
-        split = text[:max_chars].rfind(".")
-        split = split if split != -1 else max_chars
-        chunks.append(text[:split])
-        text = text[split:]
-    chunks.append(text)
-    return chunks
 
+def summarize_text(text, top_n=5):
+    sentences = split_sentences(text)
+
+    if len(sentences) <= top_n:
+        return sentences
+
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf = vectorizer.fit_transform(sentences)
+
+    similarity_matrix = cosine_similarity(tfidf)
+    scores = similarity_matrix.sum(axis=1)
+
+    ranked_idx = np.argsort(scores)[::-1]
+    return [sentences[i] for i in ranked_idx[:top_n]]
+
+
+def risk_level(n):
+    if n >= 4:
+        return "HIGH"
+    elif n >= 2:
+        return "MEDIUM"
+    return "LOW"
 
 # ==============================
-# LLM CALL (SAFE)
+# INPUT (NO CARD)
 # ==============================
-def llm_summarize(text):
-    prompt = f"""
-You are a consumer rights assistant.
+st.subheader("Analyze Terms")
 
-Analyze the following Terms of Service or Privacy Policy.
-List EXACTLY 5 things a user should know.
-Highlight risks clearly.
-Use simple, non-legal language.
-Do NOT defend the company.
-
-TEXT:
-{text}
-
-Return only 5 numbered points.
-"""
-
-    try:
-        return client.text_generation(
-            prompt,
-            max_new_tokens=250,
-            temperature=0.2,
-            timeout=60
-        )
-    except Exception:
-        return (
-            "⚠️ The AI model is currently busy.\n"
-            "1. The policy contains legal limitations.\n"
-            "2. User rights may be restricted.\n"
-            "3. Data handling terms apply.\n"
-            "4. Account actions are controlled by the company.\n"
-            "5. Policy terms may change over time."
-        )
-
-
-def calculate_risk(summary):
-    keywords = [
-        "data", "share", "sell", "terminate",
-        "arbitration", "license", "tracking"
-    ]
-    score = sum(k in summary.lower() for k in keywords)
-
-    if score >= 4:
-        return "HIGH 🔴"
-    elif score >= 2:
-        return "MEDIUM 🟠"
-    return "LOW 🟢"
-
-
-# ==============================
-# UI INPUT
-# ==============================
 mode = st.radio(
-    "Choose input type",
+    "Input type",
     ["Website URL", "PDF Document"],
-    key="input_mode"
+    horizontal=True
 )
 
 raw_text = ""
 
 if mode == "Website URL":
     url = st.text_input(
-        "Paste Terms of Service / Privacy Policy URL",
-        key="url_input"
+        "Terms of Service or Privacy Policy URL",
+        placeholder="https://example.com/terms"
     )
     if url:
         raw_text = fetch_text_from_url(url)
-
 else:
     pdf = st.file_uploader(
-        "Upload Terms PDF",
-        type=["pdf"],
-        key="pdf_input"
+        "Upload Terms and Conditions PDF",
+        type=["pdf"]
     )
     if pdf:
         raw_text = extract_text_from_pdf(pdf)
 
-
 # ==============================
-# ANALYZE
+# ANALYZE + RESULTS
 # ==============================
-if st.button("Analyze", key="analyze_btn"):
+if st.button("Analyze"):
     if not raw_text.strip():
         st.warning("Please provide a valid URL or PDF.")
     else:
-        with st.spinner("Analyzing document (may take up to 1 minute)..."):
-            chunks = chunk_text(raw_text)
+        with st.spinner("Analyzing document..."):
+            summary = summarize_text(raw_text)
 
-            # 🔒 LIMIT TO FIRST CHUNK (IMPORTANT)
-            summary = llm_summarize(chunks[0])
+            html = """
+            <div class="result-card">
+                <h3>5 Things You Should Know</h3>
+                <ol>
+            """
 
-            st.subheader("🔍 5 Things You Should Know")
-            st.write(summary)
+            for s in summary:
+                html += f"<li>{s}</li>"
 
-            st.markdown("---")
-            st.write(f"**Risk Level:** {calculate_risk(summary)}")
+            html += f"""
+                </ol>
+                <p style="margin-top:16px;"><strong>Risk Level:</strong> {risk_level(len(summary))}</p>
+                <p style="font-size:12px; opacity:0.85;">
+                    This summary is generated using extractive NLP-based sentence ranking.
+                </p>
+            </div>
+            """
+
+            st.markdown(html, unsafe_allow_html=True)
+
